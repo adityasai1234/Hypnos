@@ -619,3 +619,276 @@ fn run_sql(conn: &Connection, sql: &str, params_json: &str) -> String {
         Err(e) => err_json(&e.to_string()),
     }
 }
+
+pub fn actor_path(root: &Path, ns: &str, id: &str) -> PathBuf {
+    // ponytail: FNV-1a shard. Not stable across languages. Replace if another
+    // process has to compute the same path.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in id.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    let shard = (h % 256) as u8;
+    root.join("actors")
+        .join(ns)
+        .join(format!("{shard:02x}"))
+        .join(format!("{id}.sqlite"))
+}
+
+fn check_name(what: &str, s: &str) -> Result<()> {
+    if s.is_empty() || s.contains(['/', '\\', '.']) {
+        bail!("bad {what}");
+    }
+    Ok(())
+}
+
+fn open_actor_db(path: &Path) -> Result<Connection> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = Connection::open(path)?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "FULL")?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _alarm(
+            id INTEGER PRIMARY KEY CHECK(id = 1),
+            at_ms INTEGER
+        )",
+    )?;
+    Ok(conn)
+}
+
+impl Meter {
+    pub fn open(root: &Path) -> Result<Self> {
+        std::fs::create_dir_all(root)?;
+        let conn = Connection::open(root.join("system.sqlite"))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meter(
+                id INTEGER PRIMARY KEY,
+                ts_ns INTEGER NOT NULL,
+                actor TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                amount INTEGER NOT NULL
+            )",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    pub fn insert(&self, actor: &str, kind: &str, amount: i64) -> Result<()> {
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64;
+        let conn = self.conn.lock().map_err(|e| anyhow!("{e}"))?;
+        conn.execute(
+            "INSERT INTO meter(ts_ns, actor, kind, amount) VALUES(?1, ?2, ?3, ?4)",
+            (ts, actor, kind, amount),
+        )?;
+        Ok(())
+    }
+
+    pub fn ledger(&self) -> Result<Ledger> {
+        let conn = self.conn.lock().map_err(|e| anyhow!("{e}"))?;
+        let requests: i64 =
+            conn.query_row("SELECT count(*) FROM meter WHERE kind = 'request'", [], |r| {
+                r.get(0)
+            })?;
+        let cpus: i64 =
+            conn.query_row("SELECT count(*) FROM meter WHERE kind = 'cpu'", [], |r| r.get(0))?;
+        Ok(Ledger { requests, cpus })
+    }
+
+    pub fn cpu_of(&self, actor: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().map_err(|e| anyhow!("{e}"))?;
+        let n = conn
+            .query_row(
+                "SELECT amount FROM meter WHERE actor = ?1 AND kind = 'cpu' ORDER BY id DESC LIMIT 1",
+                [actor],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(n)
+    }
+
+    pub fn integrity(&self) -> Result<()> {
+        let conn = self.conn.lock().map_err(|e| anyhow!("{e}"))?;
+        integrity(&conn)
+    }
+}
+
+pub fn integrity(conn: &Connection) -> Result<()> {
+    let s: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
+    if s != "ok" {
+        bail!("integrity_check: {s}");
+    }
+    Ok(())
+}
+
+fn boom(name: &str) {
+    if std::env::var("HYPNOS_FAILPOINT").ok().as_deref() == Some(name) {
+        std::process::abort();
+    }
+}
+
+impl Actor {
+    pub fn new(root: &Path, ns: &str, id: &str, script: &str) -> Result<Self> {
+        check_name("namespace", ns)?;
+        check_name("id", id)?;
+        Ok(Self {
+            path: actor_path(root, ns, id),
+            ns: ns.to_string(),
+            id: id.to_string(),
+            script: script.to_string(),
+            phases: Phases::default(),
+            last_cpu: 0,
+            last_used: Instant::now(),
+            live: None,
+        })
+    }
+
+    pub fn is_awake(&self) -> bool {
+        self.live.is_some()
+    }
+
+    pub fn sleep(&mut self) {
+        self.live = None;
+    }
+
+    pub fn memory_contains(&mut self, needle: &[u8]) -> Result<bool> {
+        let live = self.live.as_ref().context("actor is asleep")?;
+        let data = live.memory.data(&live.store);
+        if needle.is_empty() || data.len() < needle.len() {
+            return Ok(false);
+        }
+        Ok(data.windows(needle.len()).any(|w| w == needle))
+    }
+
+    pub async fn wake(&mut self, eng: &Eng) -> Result<()> {
+        let t0 = Instant::now();
+        let db = open_actor_db(&self.path)?;
+        let open_sqlite = t0.elapsed();
+        let mut wasi = WasiCtxBuilder::new();
+        let wasi = wasi.build_p1();
+        let state = HostState {
+            wasi,
+            db,
+            limits: StoreLimitsBuilder::new()
+                .memory_size(MEM_LIMIT)
+                .trap_on_grow_failure(true)
+                .build(),
+            http: eng.cfg.http.clone(),
+            ai: eng.cfg.ai.clone(),
+            epoch_ticks: eng.cfg.epoch_ticks,
+            meter: eng.cfg.meter,
+            failpoint: eng.cfg.failpoint.clone(),
+            cpu_ns: 0,
+            cpu_mark: 0,
+            in_tx: false,
+        };
+        let mut store = Store::new(&eng.engine, state);
+        store.limiter(|s| &mut s.limits);
+        if eng.cfg.meter {
+            install_hook(&mut store);
+        }
+        store.set_epoch_deadline(eng.cfg.epoch_ticks);
+        let t1 = Instant::now();
+        let instance = eng.pre.instantiate_async(&mut store).await?;
+        let instantiate = t1.elapsed();
+        let memory = instance
+            .get_memory(&mut store, "memory")
+            .context("memory export")?;
+        let alloc = instance.get_typed_func(&mut store, "alloc")?;
+        let init = instance.get_typed_func(&mut store, "init")?;
+        let call = instance.get_typed_func(&mut store, "call")?;
+        let last_error = instance.get_typed_func(&mut store, "last_error")?;
+        let mut live = Live {
+            store,
+            memory,
+            alloc,
+            init,
+            call,
+            last_error,
+        };
+        LIVE.fetch_add(1, Ordering::SeqCst);
+        let t2 = Instant::now();
+        let init_result = eval_script(&mut live, &self.script).await;
+        let eval = t2.elapsed();
+        self.phases.open_sqlite = open_sqlite;
+        self.phases.instantiate = instantiate;
+        self.phases.eval = eval;
+        self.last_cpu = live.store.data().cpu_ns;
+        if let Err(e) = init_result {
+            drop(live);
+            return Err(e);
+        }
+        self.live = Some(live);
+        self.last_used = Instant::now();
+        Ok(())
+    }
+
+    pub async fn request(&mut self, eng: &Eng, meter: &Meter, req: &str) -> Result<serde_json::Value> {
+        if eng.cfg.meter {
+            meter.insert(&self.id, "request", 1)?;
+        }
+        boom("after_request");
+        if self.live.is_none() {
+            if let Err(e) = self.wake(eng).await {
+                if eng.cfg.meter {
+                    meter.insert(&self.id, "cpu", self.last_cpu as i64)?;
+                }
+                return Err(e);
+            }
+        } else {
+            self.phases.open_sqlite = Duration::ZERO;
+            self.phases.instantiate = Duration::ZERO;
+            self.phases.eval = Duration::ZERO;
+            let live = self.live.as_mut().unwrap();
+            live.store.data_mut().cpu_ns = 0;
+            live.store.set_epoch_deadline(eng.cfg.epoch_ticks);
+        }
+        let live = self.live.as_mut().unwrap();
+        live.store.data_mut().begin_tx()?;
+        let t = Instant::now();
+        let called = invoke(live, req).await;
+        self.phases.handler = t.elapsed();
+        let cpu = self.live.as_ref().unwrap().store.data().cpu_ns;
+        self.last_cpu = cpu;
+        let finish = match called {
+            Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+                Ok(v) if v.get("trap").is_some() => {
+                    let msg = v["trap"].as_str().unwrap_or("trap").to_string();
+                    Err(anyhow!(msg))
+                }
+                Ok(v) => Ok(v.get("ok").cloned().unwrap_or(v)),
+                Err(e) => Err(anyhow!("bad guest json: {e}: {text}")),
+            },
+            Err(e) => Err(e),
+        };
+        if finish.is_err() {
+            if let Some(live) = self.live.as_mut() {
+                live.store.data_mut().rollback_tx()?;
+            }
+            if eng.cfg.meter {
+                meter.insert(&self.id, "cpu", cpu as i64)?;
+            }
+            // A wasm trap can leave QuickJS mid-call. Drop the guest so the next
+            // request on this actor wakes clean.
+            self.sleep();
+            self.last_used = Instant::now();
+            return finish;
+        }
+        boom("after_guest");
+        self.live.as_mut().unwrap().store.data_mut().commit_tx()?;
+        boom("after_commit");
+        if eng.cfg.meter {
+            meter.insert(&self.id, "cpu", cpu as i64)?;
+        }
+        self.last_used = Instant::now();
+        finish
+    }
+}
