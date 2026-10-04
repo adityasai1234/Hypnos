@@ -215,3 +215,203 @@ async fn cmd_compile(args: &[String]) -> Result<()> {
     println!("PASS compile");
     Ok(())
 }
+
+async fn cmd_run(args: &[String]) -> Result<()> {
+    let script_path = opt(args, "--script").context("--script is required")?;
+    let root = root_of(args);
+    let meter = Meter::open(&root)?;
+    println!("pid {}", std::process::id());
+    let mut script = std::fs::read_to_string(&script_path)?;
+    let mut eng = eng_from(args, true, host::EPOCH_TICKS, Vec::new())?;
+    let mut actor = Actor::new(&root, "run", "main", &script)?;
+    let out = actor.request(&eng, &meter, "{}").await?;
+    println!("{out}");
+    let stdin = std::io::stdin();
+    let mut line = String::new();
+    let mut locked = stdin.lock();
+    while locked.read_line(&mut line)? > 0 {
+        script = std::fs::read_to_string(&script_path)?;
+        eng = eng_from(args, true, host::EPOCH_TICKS, Vec::new())?;
+        actor.script = script.clone();
+        actor.sleep();
+        let out = actor.request(&eng, &meter, "{}").await?;
+        println!("pid {} {out}", std::process::id());
+        line.clear();
+    }
+    println!("PASS run");
+    Ok(())
+}
+
+async fn cmd_trap(args: &[String]) -> Result<()> {
+    let root = root_of(args);
+    let script = load_script(args)?;
+    let meter = Meter::open(&root)?;
+    let pid = std::process::id();
+    let mut eng = eng_from(args, true, host::EPOCH_TICKS, Vec::new())?;
+    let cases = [
+        ("heap", r#"{"trap":"heap"}"#, 30_000u64),
+        ("loop", r#"{"trap":"loop"}"#, host::EPOCH_TICKS),
+        ("recurse", r#"{"trap":"recurse"}"#, host::EPOCH_TICKS),
+        ("throw", r#"{"trap":"throw"}"#, host::EPOCH_TICKS),
+    ];
+    for (name, req, ticks) in cases {
+        eng.cfg.epoch_ticks = ticks;
+        let before = meter.ledger()?;
+        let mut actor = Actor::new(&root, "trap", name, &script)?;
+        let err = actor
+            .request(&eng, &meter, req)
+            .await
+            .err()
+            .context(format!("{name} did not fail"))?;
+        let rows = host::table_count(&actor.path, "c")?;
+        if rows != 0 {
+            bail!("{name}: insert survived a trap (count {rows})");
+        }
+        let after = meter.ledger()?;
+        if after.requests != before.requests + 1 || after.cpus != before.cpus + 1 {
+            bail!(
+                "{name}: meter requests {}->{} cpus {}->{}",
+                before.requests,
+                after.requests,
+                before.cpus,
+                after.cpus
+            );
+        }
+        eng.cfg.epoch_ticks = host::EPOCH_TICKS;
+        let ok = actor.request(&eng, &meter, "{}").await?;
+        if std::process::id() != pid {
+            bail!("pid changed");
+        }
+        println!("PASS trap {name} pid {pid} err {err:#} next {ok}");
+    }
+    eng.cfg.epoch_ticks = host::EPOCH_TICKS;
+    let before = meter.ledger()?;
+    let mut actor = Actor::new(&root, "trap", "syntax", "this is not javascript")?;
+    let err = actor
+        .request(&eng, &meter, "{}")
+        .await
+        .err()
+        .context("syntax error did not fail")?;
+    let after = meter.ledger()?;
+    if after.requests != before.requests + 1 || after.cpus != before.cpus + 1 {
+        bail!(
+            "syntax: meter requests {}->{} cpus {}->{}",
+            before.requests,
+            after.requests,
+            before.cpus,
+            after.cpus
+        );
+    }
+    actor.script = script;
+    let ok = actor.request(&eng, &meter, "{}").await?;
+    println!("PASS trap syntax pid {pid} err {err:#} next {ok}");
+    Ok(())
+}
+
+async fn cmd_agent(args: &[String]) -> Result<()> {
+    if let Some(url) = opt(args, "--real") {
+        let ai = opt(args, "--ai")
+            .map(|s| AiEntry::parse(&s))
+            .transpose()?
+            .into_iter()
+            .collect();
+        let eng = eng_from(args, true, host::EPOCH_TICKS, ai)?;
+        let root = root_of(args);
+        let meter = Meter::open(&root)?;
+        let script = load_script(args)?;
+        let mut actor = Actor::new(&root, "agent", "real", &script)?;
+        let body = format!(r#"{{"url":{url:?},"text":"hello"}}"#);
+        let out = actor.request(&eng, &meter, &body).await?;
+        println!("{out}");
+        return Ok(());
+    }
+    let delay_ms = opt_u64(args, "--delay-ms", 5000);
+    let hits = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let hits2 = hits.clone();
+    tokio::spawn(async move {
+        mock_loop(listener, hits2, Duration::from_millis(delay_ms)).await;
+    });
+    let allow = format!("127.0.0.1:{}=HYPNOS_TEST_KEY", addr.port());
+    let key = "hypnos-key-scan-9f3a2c";
+    unsafe { std::env::set_var("HYPNOS_TEST_KEY", key) };
+    let eng = eng_from(args, true, host::EPOCH_TICKS, vec![AiEntry::parse(&allow)?])?;
+    let root = root_of(args);
+    let meter = Meter::open(&root)?;
+    let agent_src = load_script(args)?;
+    let counter_src = std::fs::read_to_string("scripts/counter.js")?;
+    let mut probe = Actor::new(&root, "agent", "probe", &agent_src)?;
+    let wrong = addr.port() + 1;
+    let probe_req = format!(
+        r#"{{"probe":["http://evil.example/v1","http://127.0.0.1:{wrong}/v1"]}}"#
+    );
+    let probed = probe.request(&eng, &meter, &probe_req).await?;
+    if hits.load(Ordering::SeqCst) != 0 {
+        bail!("disallowed host reached the mock");
+    }
+    let outs = probed["out"]
+        .as_array()
+        .context("probe result")?
+        .clone();
+    if outs.iter().any(|v| v.as_str() == Some("allowed")) {
+        bail!("a disallowed host was allowed: {probed}");
+    }
+    println!("PASS agent reject {probed}");
+
+    let mut counter = Actor::new(&root, "agent", "counter", &counter_src)?;
+    let mut idle = Vec::new();
+    for _ in 0..200 {
+        let t = Instant::now();
+        counter.request(&eng, &meter, "{}").await?;
+        idle.push(t.elapsed());
+    }
+    let idle_p99 = pct_dur(&mut idle, 0.99);
+
+    let mut agent = Actor::new(&root, "agent", "chat", &agent_src)?;
+    let url = format!("http://{addr}/v1/chat");
+    let req = format!(r#"{{"url":{url:?},"text":"hello"}}"#);
+    let agent_fut = agent.request(&eng, &meter, &req);
+    let counter_fut = async {
+        let mut lats = Vec::new();
+        for _ in 0..200 {
+            let t = Instant::now();
+            counter.request(&eng, &meter, "{}").await?;
+            lats.push(t.elapsed());
+        }
+        Ok::<_, anyhow::Error>(lats)
+    };
+    let (agent_res, lats) = tokio::join!(agent_fut, counter_fut);
+    let agent_res = agent_res?;
+    let mut lats = lats?;
+    let live_p99 = pct_dur(&mut lats, 0.99);
+    let slack = idle_p99.saturating_mul(2) + Duration::from_millis(5);
+    if live_p99 > slack {
+        bail!("counter p99 {live_p99:?} exceeded idle {idle_p99:?} * 2");
+    }
+    let cpu = meter.cpu_of("chat")?.context("missing cpu row")?;
+    if cpu > 50_000_000 {
+        bail!("agent cpu {cpu} ns includes the model wait");
+    }
+    if !agent_res["body"].as_str().unwrap_or("").contains("ok") {
+        bail!("unexpected agent body {agent_res}");
+    }
+    if agent.memory_contains(key.as_bytes())? {
+        bail!("api key is in guest memory");
+    }
+    println!(
+        "PASS agent overlap idle_p99_us {} live_p99_us {} cpu_ns {cpu}",
+        idle_p99.as_micros(),
+        live_p99.as_micros()
+    );
+
+    let mut trap = Actor::new(&root, "agent", "trap", &agent_src)?;
+    let trap_req = format!(r#"{{"url":{url:?},"trap_after":true}}"#);
+    let err = trap.request(&eng, &meter, &trap_req).await.err().context("trap_after did not fail")?;
+    let bodies = host::message_bodies(&trap.path)?;
+    if !bodies.iter().any(|b| b == "kept") || bodies.iter().any(|b| b == "lost") {
+        bail!("commit point failed, bodies {bodies:?} err {err:#}");
+    }
+    println!("PASS agent commit-point");
+    Ok(())
+}
