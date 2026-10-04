@@ -415,3 +415,239 @@ async fn cmd_agent(args: &[String]) -> Result<()> {
     println!("PASS agent commit-point");
     Ok(())
 }
+
+async fn mock_loop(listener: TcpListener, hits: Arc<AtomicUsize>, delay: Duration) {
+    loop {
+        let Ok((mut sock, _)) = listener.accept().await else {
+            break;
+        };
+        hits.fetch_add(1, Ordering::SeqCst);
+        tokio::spawn(async move {
+            let _ = read_http(&mut sock).await;
+            tokio::time::sleep(delay).await;
+            let body = br#"{"content":"ok"}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body).await;
+        });
+    }
+}
+
+async fn read_http(sock: &mut tokio::net::TcpStream) -> Result<()> {
+    let mut buf = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        let n = sock.read(&mut tmp).await?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            let header = String::from_utf8_lossy(&buf[..i]);
+            let len = header.lines().find_map(|line| {
+                let (k, v) = line.split_once(':')?;
+                if k.eq_ignore_ascii_case("content-length") {
+                    v.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            });
+            if let Some(len) = len {
+                while buf.len() < i + 4 + len {
+                    let n = sock.read(&mut tmp).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    buf.extend_from_slice(&tmp[..n]);
+                }
+            }
+            break;
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_wake(args: &[String]) -> Result<()> {
+    let iters = opt_u64(args, "--iters", 1000);
+    let cold_iters = opt_u64(args, "--cold-iters", iters.min(30));
+    let meter_on = !flag(args, "--no-meter");
+    let handler = opt(args, "--handler").unwrap_or_else(|| "both".into());
+    let root = root_of(args);
+    let script = load_script(args)?;
+    let eng = eng_from(args, meter_on, host::EPOCH_TICKS, Vec::new())?;
+    let meter = Meter::open(&root)?;
+    heap_check(&eng, &meter, &root, &script).await?;
+
+    let handlers: &[&str] = match handler.as_str() {
+        "read" => &["read"],
+        "write" => &["write"],
+        _ => &["read", "write"],
+    };
+    for kind in handlers {
+        let req = if *kind == "read" {
+            r#"{"op":"read"}"#
+        } else {
+            "{}"
+        };
+        let hot = bench_class(&eng, &meter, &root, &script, kind, req, iters, "hot", false).await?;
+        let warm = bench_class(&eng, &meter, &root, &script, kind, req, iters, "warm", false).await?;
+        match host::drop_page_cache() {
+            Ok(()) => {
+                let cold = bench_class(
+                    &eng, &meter, &root, &script, kind, req, cold_iters, "cold", true,
+                )
+                .await?;
+                print_samples(kind, meter_on, "cold", &cold);
+            }
+            Err(e) => println!("SKIP cold {kind}: {e:#}"),
+        }
+        print_samples(kind, meter_on, "hot", &hot);
+        print_samples(kind, meter_on, "warm", &warm);
+        if *kind == "write" && meter_on {
+            let mut totals: Vec<u128> = warm.iter().map(|s| s.total).collect();
+            let p50 = pct(&mut totals, 0.50);
+            let engine: u128 = warm.iter().map(|s| s.instantiate + s.eval).sum::<u128>()
+                / warm.len().max(1) as u128;
+            let verdict = if p50 < 10_000_000 && engine * 2 < p50.max(1) {
+                "INSIDE"
+            } else if engine > 20_000_000 {
+                "NO-GO"
+            } else {
+                "OUTSIDE"
+            };
+            println!(
+                "fixed-line warm-write p50_us {} engine_us {} {verdict}",
+                p50 / 1000,
+                engine / 1000
+            );
+        }
+    }
+    println!("PASS wake-bench");
+    Ok(())
+}
+
+async fn heap_check(eng: &Eng, meter: &Meter, root: &Path, script: &str) -> Result<()> {
+    let mut actor = Actor::new(root, "bench", "heap", script)?;
+    for i in 1..=3 {
+        let v = actor.request(eng, meter, "{}").await?;
+        let heap = v["heap"].as_i64().unwrap_or(0);
+        let sql = v["sql"].as_i64().unwrap_or(0);
+        if heap != i || sql != i {
+            bail!("warm heap check got {v}, want heap {i} sql {i}");
+        }
+    }
+    if host::live_count() == 0 {
+        bail!("actor was not live");
+    }
+    actor.sleep();
+    if host::live_count() != 0 {
+        bail!("heap still live after sleep, count {}", host::live_count());
+    }
+    let v = actor.request(eng, meter, "{}").await?;
+    if v["heap"].as_i64() != Some(1) || v["sql"].as_i64() != Some(4) {
+        bail!("wake after sleep got {v}, want heap 1 sql 4");
+    }
+    actor.request(eng, meter, "{}").await?;
+    std::thread::sleep(Duration::from_millis(60));
+    let mut pair = [actor];
+    host::sweep(&mut pair, Instant::now(), Duration::from_millis(50));
+    if pair[0].is_awake() || host::live_count() != 0 {
+        bail!("sweep did not drop the idle actor");
+    }
+    println!("PASS heap-reset");
+    Ok(())
+}
+
+struct Sample {
+    open: u128,
+    instantiate: u128,
+    eval: u128,
+    handler: u128,
+    total: u128,
+}
+
+async fn bench_class(
+    eng: &Eng,
+    meter: &Meter,
+    root: &Path,
+    script: &str,
+    kind: &str,
+    req: &str,
+    iters: u64,
+    class: &str,
+    cold: bool,
+) -> Result<Vec<Sample>> {
+    let mut actor = Actor::new(root, "bench", &format!("{kind}-{class}"), script)?;
+    actor.request(eng, meter, "{}").await?;
+    if class != "hot" {
+        actor.sleep();
+    }
+    let mut out = Vec::with_capacity(iters as usize);
+    for i in 0..iters {
+        if class != "hot" {
+            actor.sleep();
+        }
+        if cold {
+            host::drop_page_cache()?;
+        }
+        let t = Instant::now();
+        actor.request(eng, meter, req).await?;
+        let total = t.elapsed().as_nanos();
+        out.push(Sample {
+            open: actor.phases.open_sqlite.as_nanos(),
+            instantiate: actor.phases.instantiate.as_nanos(),
+            eval: actor.phases.eval.as_nanos(),
+            handler: actor.phases.handler.as_nanos(),
+            total,
+        });
+        if i > 0 && i % 100 == 0 {
+            println!("{class} {kind} {i}/{iters}");
+        }
+    }
+    Ok(out)
+}
+
+fn print_samples(kind: &str, meter_on: bool, class: &str, samples: &[Sample]) {
+    let mut open: Vec<u128> = samples.iter().map(|s| s.open).collect();
+    let mut inst: Vec<u128> = samples.iter().map(|s| s.instantiate).collect();
+    let mut eval: Vec<u128> = samples.iter().map(|s| s.eval).collect();
+    let mut handler: Vec<u128> = samples.iter().map(|s| s.handler).collect();
+    let mut total: Vec<u128> = samples.iter().map(|s| s.total).collect();
+    let meter = if meter_on { "meter" } else { "no-meter" };
+    println!(
+        "{class} {kind} {meter} n {} open_us {}/{}/{} instantiate_us {}/{}/{} eval_us {}/{}/{} handler_us {}/{}/{} total_us {}/{}/{}",
+        samples.len(),
+        pct(&mut open, 0.50) / 1000,
+        pct(&mut open, 0.95) / 1000,
+        pct(&mut open, 0.99) / 1000,
+        pct(&mut inst, 0.50) / 1000,
+        pct(&mut inst, 0.95) / 1000,
+        pct(&mut inst, 0.99) / 1000,
+        pct(&mut eval, 0.50) / 1000,
+        pct(&mut eval, 0.95) / 1000,
+        pct(&mut eval, 0.99) / 1000,
+        pct(&mut handler, 0.50) / 1000,
+        pct(&mut handler, 0.95) / 1000,
+        pct(&mut handler, 0.99) / 1000,
+        pct(&mut total, 0.50) / 1000,
+        pct(&mut total, 0.95) / 1000,
+        pct(&mut total, 0.99) / 1000,
+    );
+}
+
+fn pct(xs: &mut [u128], p: f64) -> u128 {
+    if xs.is_empty() {
+        return 0;
+    }
+    xs.sort_unstable();
+    let i = ((xs.len() - 1) as f64 * p).round() as usize;
+    xs[i.min(xs.len() - 1)]
+}
+
+fn pct_dur(xs: &mut [Duration], p: f64) -> Duration {
+    let mut ns: Vec<u128> = xs.iter().map(|d| d.as_nanos()).collect();
+    Duration::from_nanos(pct(&mut ns, p) as u64)
+}
