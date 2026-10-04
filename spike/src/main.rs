@@ -651,3 +651,214 @@ fn pct_dur(xs: &mut [Duration], p: f64) -> Duration {
     let mut ns: Vec<u128> = xs.iter().map(|d| d.as_nanos()).collect();
     Duration::from_nanos(pct(&mut ns, p) as u64)
 }
+
+fn cmd_crash(args: &[String]) -> Result<()> {
+    let wasm = must_wasm(args)?;
+    let script = opt(args, "--script").context("--script")?;
+    let cwasm = PathBuf::from("engine/guest.cwasm");
+    host::compile_file(&wasm, &cwasm, None)?;
+    let kills = opt_u64(args, "--kills", 500);
+    let each = opt_u64(args, "--fail-each", 100);
+    let base = root_of(args).join("crash");
+    let _ = std::fs::remove_dir_all(&base);
+    for point in ["after_request", "inside_guest", "after_guest", "after_commit"] {
+        for i in 0..each {
+            let dir = base.join(point).join(i.to_string());
+            std::fs::create_dir_all(&dir)?;
+            let mut child = spawn_child(&dir, &cwasm, Path::new(&script), Some(point))?;
+            let mut stdout = child.stdout.take().unwrap();
+            let reader = std::thread::spawn(move || {
+                let mut s = String::new();
+                let _ = stdout.read_to_string(&mut s);
+                s
+            });
+            let started = Instant::now();
+            loop {
+                if child.try_wait()?.is_some() {
+                    break;
+                }
+                if started.elapsed() > Duration::from_secs(30) {
+                    let _ = child.kill();
+                    bail!("{point} #{i} did not abort");
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let out = reader.join().unwrap_or_default();
+            let actor = host::actor_path(&dir, "crash", "one");
+            host::check_files(&dir, &actor)?;
+            check_acks(&out, &actor)?;
+            if i == 0 || i + 1 == each {
+                println!("PASS failpoint {point} #{i}");
+            }
+        }
+        println!("PASS failpoint {point} x {each}");
+    }
+    for i in 0..kills {
+        let dir = base.join("random").join(i.to_string());
+        std::fs::create_dir_all(&dir)?;
+        let mut child = spawn_child(&dir, &cwasm, Path::new(&script), None)?;
+        let stdout = child.stdout.take().unwrap();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 || !line.starts_with("ready") {
+            let _ = child.kill();
+            bail!("random #{i} never ready: {line}");
+        }
+        let delay = i.wrapping_mul(1103515245).wrapping_add(12345) % 101;
+        std::thread::sleep(Duration::from_millis(delay as u64));
+        let _ = child.kill();
+        let _ = child.wait();
+        let mut rest = String::new();
+        reader.read_to_string(&mut rest)?;
+        let actor = host::actor_path(&dir, "crash", "one");
+        host::check_files(&dir, &actor)?;
+        check_acks(&rest, &actor)?;
+        if i == 0 || i + 1 == kills || (i + 1) % 50 == 0 {
+            println!("PASS random #{i} delay {delay} ms");
+        }
+    }
+    println!("PASS crash");
+    Ok(())
+}
+
+fn spawn_child(root: &Path, cwasm: &Path, script: &Path, fail: Option<&str>) -> Result<std::process::Child> {
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg("crash-child")
+        .arg("--root")
+        .arg(root)
+        .arg("--cwasm")
+        .arg(cwasm)
+        .arg("--script")
+        .arg(script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .env_remove("HYPNOS_FAILPOINT");
+    if let Some(point) = fail {
+        cmd.env("HYPNOS_FAILPOINT", point);
+    }
+    Ok(cmd.spawn()?)
+}
+
+fn check_acks(out: &str, actor_db: &Path) -> Result<()> {
+    let mut last = None;
+    for line in out.lines() {
+        if let Some(n) = line.strip_prefix("ack ") {
+            last = Some(n.trim().parse::<i64>().context("ack")?);
+        }
+    }
+    let count = host::table_count(actor_db, "c")?;
+    if let Some(ack) = last {
+        if count < ack || count > ack + 1 {
+            bail!("acked {ack} but c has {count}");
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_crash_child(args: &[String]) -> Result<()> {
+    let root = root_of(args);
+    let script = load_script(args)?;
+    let eng = eng_from(args, true, host::EPOCH_TICKS, Vec::new())?;
+    let meter = Meter::open(&root)?;
+    let mut actor = Actor::new(&root, "crash", "one", &script)?;
+    actor.wake(&eng).await?;
+    println!("ready");
+    let _ = std::io::stdout().flush();
+    loop {
+        let v = actor
+            .request(&eng, &meter, r#"{"burn_ms":20}"#)
+            .await?;
+        println!("ack {}", v["sql"].as_i64().unwrap_or(0));
+        let _ = std::io::stdout().flush();
+    }
+}
+
+async fn cmd_churn(args: &[String]) -> Result<()> {
+    if std::env::var("HYPNOS_CHURN_INNER").ok().as_deref() != Some("1") {
+        for pooling in ["0", "1"] {
+            let status = Command::new(std::env::current_exe()?)
+                .args(std::env::args().skip(1))
+                .env("HYPNOS_POOLING", pooling)
+                .env("HYPNOS_CHURN_INNER", "1")
+                .status()?;
+            if !status.success() {
+                bail!("churn pooling={pooling} failed");
+            }
+        }
+        println!("PASS churn");
+        return Ok(());
+    }
+    let actors_n = opt_u64(args, "--actors", 5000);
+    let rounds = opt_u64(args, "--rounds", 5);
+    let root = root_of(args);
+    let script = load_script(args)?;
+    let eng = eng_from(args, false, host::EPOCH_TICKS, Vec::new())?;
+    let meter = Meter::open(&root)?;
+    let mut base = None;
+    for round in 0..rounds {
+        for i in 0..actors_n {
+            let mut actor = Actor::new(&root, "churn", &format!("a{i}"), &script)?;
+            actor.request(&eng, &meter, "{}").await?;
+            actor.sleep();
+        }
+        host::trim_heap();
+        let rss = host::anon_rss_kb().or_else(host::vm_rss_kb).unwrap_or(0);
+        let delta = base.map(|p: u64| rss as i64 - p as i64).unwrap_or(0);
+        println!(
+            "round {round} pooling {} rss_kb {rss} delta_kb {delta}",
+            host::pooling_from_env() as u8
+        );
+        if round == 1 {
+            base = Some(rss);
+        }
+        if round >= 2 {
+            if let Some(start) = base {
+                let grown = rss.saturating_sub(start);
+                let allowed = 50 * (actors_n / 1000).max(1);
+                if grown > allowed {
+                    bail!("rss grew {grown} kb after round {round}, allowed {allowed}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cmd_boot(args: &[String]) -> Result<()> {
+    let spec = opt(args, "--n").unwrap_or_else(|| "1000,10000,100000".into());
+    let root = root_of(args).join("scan");
+    for part in spec.split(',') {
+        let n: u64 = part.trim().parse().context("--n")?;
+        println!("creating {n} actor files");
+        host::ensure_scan_files(&root, n)?;
+        let (warm_us, alarms, earliest) = host::boot_scan(&root, n).await?;
+        let per = warm_us as f64 / n as f64;
+        println!(
+            "warm n {n} total_ms {} us_per_file {per:.1} with_alarm {alarms} earliest {earliest:?}",
+            warm_us / 1000
+        );
+        let mut slowest = warm_us;
+        match host::drop_page_cache() {
+            Ok(()) => {
+                let (cold_us, alarms, earliest) = host::boot_scan(&root, n).await?;
+                let per = cold_us as f64 / n as f64;
+                println!(
+                    "cold n {n} total_ms {} us_per_file {per:.1} with_alarm {alarms} earliest {earliest:?}",
+                    cold_us / 1000
+                );
+                slowest = slowest.max(cold_us);
+            }
+            Err(e) => println!("SKIP cold scan {n}: {e:#}"),
+        }
+        if n >= 100_000 && slowest > 10_000_000 {
+            println!(
+                "DESIGN SIGNAL: {n} actor files took {} ms to rearm. An alarm index in system.sqlite, rebuilt when missing, is the fallback. Not a spike fix.",
+                slowest / 1000
+            );
+        }
+    }
+    println!("PASS boot-scan");
+    Ok(())
+}
