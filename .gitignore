@@ -1,0 +1,7 @@
+/target
+/engine
+/hypnos-data
+**/*.cwasm
+**/*.sqlite
+**/*.sqlite-*
+RESULTS.local.md

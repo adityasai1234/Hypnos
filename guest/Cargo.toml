@@ -1,0 +1,11 @@
+[package]
+name = "hypnos-guest"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# full-wasi is the crate's tested set for wasm32-wasip1 (no dyn-load).
+rquickjs = { version = "0.14", default-features = false, features = ["full-wasi"] }
