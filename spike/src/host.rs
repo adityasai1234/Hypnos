@@ -405,3 +405,217 @@ fn define_imports(linker: &mut Linker<HostState>) -> Result<()> {
     )?;
     Ok(())
 }
+
+fn install_hook(store: &mut Store<HostState>) {
+    store.call_hook(|mut cx, kind| {
+        match kind {
+            CallHook::CallingWasm | CallHook::ReturningFromHost => {
+                cx.data_mut().cpu_mark = thread_cpu_ns();
+                if matches!(kind, CallHook::ReturningFromHost) {
+                    let ticks = cx.data().epoch_ticks;
+                    cx.set_epoch_deadline(ticks);
+                }
+            }
+            CallHook::CallingHost | CallHook::ReturningFromWasm => {
+                let now = thread_cpu_ns();
+                let mark = cx.data().cpu_mark;
+                let add = now.saturating_sub(mark);
+                let prev = cx.data().cpu_ns;
+                cx.data_mut().cpu_ns = prev.saturating_add(add);
+            }
+        }
+        Ok(())
+    });
+}
+
+fn read_mem(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Result<String> {
+    if len < 0 {
+        bail!("negative length");
+    }
+    let mem = memory_of(caller)?;
+    let mut buf = vec![0u8; len as usize];
+    mem.read(&*caller, ptr as usize, &mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+fn memory_of(caller: &mut Caller<'_, HostState>) -> Result<Memory> {
+    match caller.get_export("memory") {
+        Some(Extern::Memory(m)) => Ok(m),
+        _ => bail!("guest did not export memory"),
+    }
+}
+
+async fn write_out(caller: &mut Caller<'_, HostState>, bytes: &[u8]) -> Result<i64> {
+    let ticks = caller.data().epoch_ticks;
+    // The epoch keeps moving while a host call is suspended. Reset before
+    // re-entering the guest, or the alloc that copies the result traps.
+    caller.as_context_mut().set_epoch_deadline(ticks);
+    let alloc_ext = caller.get_export("alloc").context("alloc export")?;
+    let func = match alloc_ext {
+        Extern::Func(f) => f,
+        _ => bail!("alloc is not a function"),
+    };
+    let alloc = func.typed::<i32, i32>(&*caller)?;
+    let ptr = alloc.call_async(&mut *caller, bytes.len() as i32).await?;
+    let mem = memory_of(caller)?;
+    mem.write(&mut *caller, ptr as usize, bytes)?;
+    Ok((((ptr as u64) << 32) | bytes.len() as u64) as i64)
+}
+
+fn err_json(msg: &str) -> String {
+    serde_json::json!({ "err": msg }).to_string()
+}
+
+async fn do_fetch(http: &reqwest::Client, ai: &[AiEntry], raw: &str) -> String {
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => return err_json(&e.to_string()),
+    };
+    let url = v.get("url").and_then(|u| u.as_str()).unwrap_or("");
+    let parsed = match reqwest::Url::parse(url) {
+        Ok(u) => u,
+        Err(e) => return err_json(&e.to_string()),
+    };
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return err_json("only http and https");
+    }
+    let key = match authorize(ai, &parsed) {
+        Ok(k) => k,
+        Err(e) => return err_json(&e),
+    };
+    let method = v
+        .get("method")
+        .and_then(|m| m.as_str())
+        .unwrap_or("GET");
+    let method = match reqwest::Method::from_bytes(method.as_bytes()) {
+        Ok(m) => m,
+        Err(e) => return err_json(&e.to_string()),
+    };
+    let mut req = http.request(method, parsed);
+    if let Some(map) = v.get("headers").and_then(|h| h.as_object()) {
+        for (k, val) in map {
+            if k.eq_ignore_ascii_case("authorization") {
+                continue;
+            }
+            if let Some(s) = val.as_str() {
+                req = req.header(k, s);
+            }
+        }
+    }
+    if let Some(k) = key {
+        req = req.header("authorization", format!("Bearer {k}"));
+    }
+    if let Some(body) = v.get("body").and_then(|b| b.as_str()) {
+        req = req.body(body.to_string());
+    }
+    match req.send().await {
+        Ok(resp) => {
+            let status = resp.status().as_u16();
+            let text = resp.text().await.unwrap_or_default();
+            serde_json::json!({ "status": status, "body": text }).to_string()
+        }
+        Err(e) => err_json(&e.to_string()),
+    }
+}
+
+fn authorize(ai: &[AiEntry], url: &reqwest::Url) -> Result<Option<String>, String> {
+    let host = url.host_str().ok_or_else(|| "url has no host".to_string())?;
+    let port = url.port_or_known_default();
+    for entry in ai {
+        if entry.host != host {
+            continue;
+        }
+        let port_ok = match entry.port {
+            Some(p) => port == Some(p),
+            None => port == url.port_or_known_default(),
+        };
+        if !port_ok {
+            continue;
+        }
+        let key = match &entry.key_env {
+            Some(name) => Some(
+                std::env::var(name).map_err(|_| format!("env {name} is not set"))?,
+            ),
+            None => None,
+        };
+        return Ok(key);
+    }
+    Err(format!("host not allowed: {host}"))
+}
+
+enum SqlParam {
+    Null,
+    Int(i64),
+    Real(f64),
+    Text(String),
+}
+
+impl ToSql for SqlParam {
+    fn to_sql(&self) -> rusqlite::Result<rusqlite::types::ToSqlOutput<'_>> {
+        match self {
+            SqlParam::Null => Ok(rusqlite::types::ToSqlOutput::Owned(
+                rusqlite::types::Value::Null,
+            )),
+            SqlParam::Int(n) => n.to_sql(),
+            SqlParam::Real(n) => n.to_sql(),
+            SqlParam::Text(s) => s.to_sql(),
+        }
+    }
+}
+
+fn json_param(v: &serde_json::Value) -> SqlParam {
+    match v {
+        serde_json::Value::Null => SqlParam::Null,
+        serde_json::Value::Bool(b) => SqlParam::Int(i64::from(*b)),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                SqlParam::Int(i)
+            } else {
+                SqlParam::Real(n.as_f64().unwrap_or(0.0))
+            }
+        }
+        serde_json::Value::String(s) => SqlParam::Text(s.clone()),
+        other => SqlParam::Text(other.to_string()),
+    }
+}
+
+fn run_sql(conn: &Connection, sql: &str, params_json: &str) -> String {
+    let params: Vec<serde_json::Value> =
+        serde_json::from_str(params_json).unwrap_or_else(|_| Vec::new());
+    let bound: Vec<SqlParam> = params.iter().map(json_param).collect();
+    let result = (|| -> Result<String> {
+        let mut stmt = conn.prepare(sql)?;
+        if stmt.column_count() == 0 {
+            stmt.execute(params_from_iter(bound.iter()))?;
+            return Ok(serde_json::json!({ "rows": [] }).to_string());
+        }
+        let names: Vec<String> = stmt
+            .column_names()
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut rows = stmt.query(params_from_iter(bound.iter()))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let mut obj = serde_json::Map::new();
+            for (i, name) in names.iter().enumerate() {
+                let val = match row.get_ref(i)? {
+                    rusqlite::types::ValueRef::Null => serde_json::Value::Null,
+                    rusqlite::types::ValueRef::Integer(n) => serde_json::json!(n),
+                    rusqlite::types::ValueRef::Real(n) => serde_json::json!(n),
+                    rusqlite::types::ValueRef::Text(t) => {
+                        serde_json::Value::String(String::from_utf8_lossy(t).into_owned())
+                    }
+                    rusqlite::types::ValueRef::Blob(_) => serde_json::Value::String("<blob>".into()),
+                };
+                obj.insert(name.clone(), val);
+            }
+            out.push(serde_json::Value::Object(obj));
+        }
+        Ok(serde_json::json!({ "rows": out }).to_string())
+    })();
+    match result {
+        Ok(s) => s,
+        Err(e) => err_json(&e.to_string()),
+    }
+}
