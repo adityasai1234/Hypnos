@@ -892,3 +892,210 @@ impl Actor {
         finish
     }
 }
+
+async fn eval_script(live: &mut Live, src: &str) -> Result<()> {
+    let ptr = put_bytes(live, src.as_bytes()).await?;
+    let rc = {
+        let init = live.init.clone();
+        init.call_async(&mut live.store, (ptr, src.len() as i32))
+            .await?
+    };
+    if rc != 0 {
+        let packed = {
+            let last = live.last_error.clone();
+            last.call_async(&mut live.store, ()).await?
+        };
+        let msg = read_packed(&live.store, &live.memory, packed)?;
+        bail!("init: {msg}");
+    }
+    Ok(())
+}
+
+async fn invoke(live: &mut Live, req: &str) -> Result<String> {
+    let ptr = put_bytes(live, req.as_bytes()).await?;
+    let packed = {
+        let call = live.call.clone();
+        call.call_async(&mut live.store, (ptr, req.len() as i32))
+            .await?
+    };
+    read_packed(&live.store, &live.memory, packed)
+}
+
+async fn put_bytes(live: &mut Live, bytes: &[u8]) -> Result<i32> {
+    let alloc = live.alloc.clone();
+    let ptr = alloc
+        .call_async(&mut live.store, bytes.len() as i32)
+        .await?;
+    live.memory
+        .write(&mut live.store, ptr as usize, bytes)?;
+    Ok(ptr)
+}
+
+fn read_packed(store: &Store<HostState>, memory: &Memory, packed: i64) -> Result<String> {
+    if packed == 0 {
+        return Ok(String::new());
+    }
+    let packed = packed as u64;
+    let ptr = (packed >> 32) as usize;
+    let len = packed as u32 as usize;
+    let mut buf = vec![0u8; len];
+    memory.read(store, ptr, &mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+pub fn sweep(actors: &mut [Actor], now: Instant, idle: Duration) {
+    for actor in actors {
+        if actor.live.is_some() && now.duration_since(actor.last_used) >= idle {
+            actor.live = None;
+        }
+    }
+}
+
+pub fn check_files(root: &Path, actor_file: &Path) -> Result<()> {
+    let meter = Meter::open(root)?;
+    meter.integrity()?;
+    let ledger = meter.ledger()?;
+    if ledger.cpus > ledger.requests || ledger.requests - ledger.cpus > 1 {
+        bail!(
+            "ledger requests={} cpus={} (want 0 <= requests-cpus <= 1)",
+            ledger.requests,
+            ledger.cpus
+        );
+    }
+    if actor_file.exists() {
+        let conn = Connection::open(actor_file)?;
+        integrity(&conn)?;
+    }
+    Ok(())
+}
+
+pub fn table_count(path: &Path, table: &str) -> Result<i64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let conn = Connection::open(path)?;
+    let sql = format!("SELECT count(*) FROM {table}");
+    match conn.query_row(&sql, [], |r| r.get(0)) {
+        Ok(n) => Ok(n),
+        Err(_) => Ok(0),
+    }
+}
+
+pub fn message_bodies(path: &Path) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = Connection::open(path)?;
+    let mut stmt = match conn.prepare("SELECT body FROM messages ORDER BY rowid") {
+        Ok(s) => s,
+        Err(_) => return Ok(Vec::new()),
+    };
+    let rows = stmt.query_map([], |r| r.get(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+pub async fn boot_scan(root: &Path, n: u64) -> Result<(u128, u64, Option<i64>)> {
+    let mut with_alarm = 0u64;
+    let mut earliest: Option<i64> = None;
+    let t = Instant::now();
+    for i in 0..n {
+        let path = actor_path(root, "scan", &i.to_string());
+        let conn = Connection::open_with_flags(
+            &path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        let at: Option<i64> = conn
+            .query_row("SELECT at_ms FROM _alarm WHERE id = 1", [], |r| r.get(0))
+            .optional()?;
+        if let Some(ms) = at {
+            with_alarm += 1;
+            earliest = Some(earliest.map(|e| e.min(ms)).unwrap_or(ms));
+        }
+    }
+    Ok((t.elapsed().as_micros(), with_alarm, earliest))
+}
+
+pub fn ensure_scan_files(root: &Path, n: u64) -> Result<()> {
+    for i in 0..n {
+        let path = actor_path(root, "scan", &i.to_string());
+        if path.exists() {
+            continue;
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let conn = Connection::open(&path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // ponytail: fixture build uses synchronous=OFF. The scan times opens, not fsyncs.
+        conn.pragma_update(None, "synchronous", "OFF")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _alarm(
+                id INTEGER PRIMARY KEY CHECK(id = 1),
+                at_ms INTEGER
+            )",
+        )?;
+        if i % 10 < 3 {
+            conn.execute("INSERT INTO _alarm(id, at_ms) VALUES(1, ?1)", [i as i64])?;
+        }
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    }
+    Ok(())
+}
+
+pub fn sysinfo_line() -> String {
+    let cpu = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let model = cpu
+        .lines()
+        .find(|l| l.starts_with("model name") || l.starts_with("Model"))
+        .unwrap_or("model name: unknown")
+        .to_string();
+    let flags = cpu
+        .lines()
+        .find(|l| l.starts_with("Features") || l.starts_with("flags"))
+        .unwrap_or("flags: unknown");
+    let interesting: Vec<&str> = flags
+        .split_whitespace()
+        .filter(|f| {
+            matches!(
+                *f,
+                "sse4_2" | "sse4_1" | "avx" | "avx2" | "asimd" | "sse4.2" | "sse4.1"
+            )
+        })
+        .collect();
+    let kernel = std::fs::read_to_string("/proc/version")
+        .unwrap_or_else(|_| "unknown kernel".into());
+    let kernel = kernel.split_whitespace().take(3).collect::<Vec<_>>().join(" ");
+    let glibc = glibc_version();
+    format!(
+        "wasmtime {WASMTIME_VERSION} arch {} os {} | {model} | flags {} | {kernel} | glibc {glibc}",
+        std::env::consts::ARCH,
+        std::env::consts::OS,
+        if interesting.is_empty() {
+            "none-of-sse4.2/avx/asimd".to_string()
+        } else {
+            interesting.join(",")
+        }
+    )
+}
+
+fn glibc_version() -> String {
+    #[cfg(target_env = "gnu")]
+    {
+        unsafe extern "C" {
+            fn gnu_get_libc_version() -> *const libc::c_char;
+        }
+        unsafe {
+            std::ffi::CStr::from_ptr(gnu_get_libc_version())
+                .to_string_lossy()
+                .into_owned()
+        }
+    }
+    #[cfg(not(target_env = "gnu"))]
+    {
+        "not-glibc".to_string()
+    }
+}
