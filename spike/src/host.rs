@@ -246,3 +246,162 @@ pub fn engine_config(pooling: bool, epoch: bool, target: Option<&str>) -> Result
 pub fn pooling_from_env() -> bool {
     std::env::var("HYPNOS_POOLING").ok().as_deref() == Some("1")
 }
+
+fn arm_epoch(engine: &Engine) {
+    static ONCE: Once = Once::new();
+    let engine = engine.clone();
+    ONCE.call_once(|| {
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(1));
+            engine.increment_epoch();
+        });
+    });
+}
+
+pub fn open_engine(wasm_or_cwasm: &Path, from_wasm: bool, cfg: GuestCfg) -> Result<Eng> {
+    let pooling = pooling_from_env();
+    let engine = Engine::new(&engine_config(pooling, true, None)?)?;
+    arm_epoch(&engine);
+    let cwasm_bytes;
+    let module = if from_wasm {
+        let wasm = std::fs::read(wasm_or_cwasm)?;
+        cwasm_bytes = engine.precompile_module(&wasm)?;
+        unsafe { Module::deserialize(&engine, &cwasm_bytes)? }
+    } else {
+        unsafe { Module::deserialize_file(&engine, wasm_or_cwasm)? }
+    };
+    let pre = link(&engine, &module)?;
+    Ok(Eng { engine, pre, cfg })
+}
+
+pub fn compile_file(wasm_path: &Path, out: &Path, target: Option<&str>) -> Result<usize> {
+    let pooling = pooling_from_env();
+    let engine = Engine::new(&engine_config(pooling, true, target)?)?;
+    let wasm = std::fs::read(wasm_path)?;
+    let bytes = engine.precompile_module(&wasm)?;
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(out, &bytes)?;
+    Ok(bytes.len())
+}
+
+pub fn describe_module(engine: &Engine, cwasm: &[u8]) -> Result<(Vec<String>, Vec<String>)> {
+    let module = unsafe { Module::deserialize(engine, cwasm)? };
+    let imports = module
+        .imports()
+        .map(|i| format!("{}.{}", i.module(), i.name()))
+        .collect();
+    let exports = module.exports().map(|e| e.name().to_string()).collect();
+    Ok((imports, exports))
+}
+
+pub fn reject_foreign(wasm_path: &Path) -> Result<()> {
+    let wasm = std::fs::read(wasm_path)?;
+    let host = Engine::new(&engine_config(pooling_from_env(), true, None)?)?;
+    let mut alt_cfg = engine_config(pooling_from_env(), false, None)?;
+    let _ = alt_cfg.epoch_interruption(false);
+    let alt = Engine::new(&alt_cfg)?;
+    let bytes = alt.precompile_module(&wasm)?;
+    match unsafe { Module::deserialize(&host, &bytes) } {
+        Ok(_) => bail!("cwasm compiled with a different config was accepted"),
+        Err(_) => Ok(()),
+    }
+}
+
+fn link(engine: &Engine, module: &Module) -> Result<InstancePre<HostState>> {
+    let mut linker = Linker::new(engine);
+    p1::add_to_linker_async(&mut linker, |s: &mut HostState| &mut s.wasi)?;
+    define_imports(&mut linker)?;
+    Ok(linker.instantiate_pre(module)?)
+}
+
+fn to_trap(e: anyhow::Error) -> wasmtime::Error {
+    wasmtime::Error::msg(e.to_string())
+}
+
+fn define_imports(linker: &mut Linker<HostState>) -> Result<()> {
+    linker.func_wrap_async(
+        "hypnos",
+        "sql",
+        |mut caller: Caller<'_, HostState>,
+         (q_ptr, q_len, p_ptr, p_len): (i32, i32, i32, i32)| {
+            Box::new(async move {
+                let result: anyhow::Result<i64> = async move {
+                    if caller.data().failpoint.as_deref() == Some("inside_guest") {
+                        std::process::abort();
+                    }
+                    let q = read_mem(&mut caller, q_ptr, q_len)?;
+                    let p = read_mem(&mut caller, p_ptr, p_len)?;
+                    let out = {
+                        let db = &caller.data().db;
+                        run_sql(db, &q, &p)
+                    };
+                    write_out(&mut caller, out.as_bytes()).await
+                }
+                .await;
+                result.map_err(to_trap)
+            })
+        },
+    )?;
+    linker.func_wrap_async(
+        "hypnos",
+        "set_alarm",
+        |mut caller: Caller<'_, HostState>, (at_ms,): (f64,)| {
+            Box::new(async move {
+                let result: anyhow::Result<()> = async move {
+                    caller.data_mut().db.execute(
+                        "INSERT INTO _alarm(id, at_ms) VALUES(1, ?1)
+                         ON CONFLICT(id) DO UPDATE SET at_ms = excluded.at_ms",
+                        [at_ms as i64],
+                    )?;
+                    Ok(())
+                }
+                .await;
+                result.map_err(to_trap)
+            })
+        },
+    )?;
+    linker.func_wrap_async(
+        "hypnos",
+        "delete_alarm",
+        |mut caller: Caller<'_, HostState>, (): ()| {
+            Box::new(async move {
+                let result: anyhow::Result<()> = async move {
+                    caller
+                        .data_mut()
+                        .db
+                        .execute("DELETE FROM _alarm WHERE id = 1", [])?;
+                    Ok(())
+                }
+                .await;
+                result.map_err(to_trap)
+            })
+        },
+    )?;
+    linker.func_wrap_async(
+        "hypnos",
+        "fetch",
+        |mut caller: Caller<'_, HostState>, (ptr, len): (i32, i32)| {
+            Box::new(async move {
+                let result: anyhow::Result<i64> = async move {
+                    let raw = read_mem(&mut caller, ptr, len)?;
+                    if let Err(e) = caller.data_mut().commit_tx() {
+                        return write_out(&mut caller, err_json(&e.to_string()).as_bytes()).await;
+                    }
+                    let http = caller.data().http.clone();
+                    let ai = caller.data().ai.clone();
+                    let resp = do_fetch(&http, &ai, &raw).await;
+                    // ponytail: no cap on concurrent model calls. Add a semaphore when more than one agent waits.
+                    // ponytail: no token metering. Count usage from the response body when a model returns it.
+                    // ponytail: no WebSocket streaming. The agent returns one body until a client needs live tokens.
+                    caller.data_mut().begin_tx()?;
+                    write_out(&mut caller, resp.as_bytes()).await
+                }
+                .await;
+                result.map_err(to_trap)
+            })
+        },
+    )?;
+    Ok(())
+}
