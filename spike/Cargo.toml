@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "spike"
 path = "src/main.rs"
 
+[[bin]]
+name = "hypnos"
+path = "src/bin/hypnos.rs"
+
 [dependencies]
 anyhow = "1"
 libc = "0.2"

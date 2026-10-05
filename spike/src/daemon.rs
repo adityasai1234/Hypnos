@@ -469,7 +469,7 @@ async fn write_reply(sock: &mut TcpStream, reply: &Reply) -> Result<()> {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -513,6 +513,101 @@ mod tests {
         assert!(validate_id("kitchen").is_ok());
         assert!(validate_id("_x").is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn serve_deploy_and_meter() {
+        let wasm = guest_wasm();
+        if !wasm.is_file() {
+            panic!(
+                "missing {} — cargo build -p hypnos-guest --target wasm32-wasip1 --release",
+                wasm.display()
+            );
+        }
+        let root = temp_root("serve");
+        init(&root, Some(&wasm)).unwrap();
+        let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../scripts/counter.js");
+
+        let local = tokio::task::LocalSet::new();
+        local
+            .run_until(async {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let serve_root = root.clone();
+                tokio::task::spawn_local(async move {
+                    if let Err(e) = serve(serve_root, 0, Some(tx)).await {
+                        panic!("serve: {e:#}");
+                    }
+                });
+                let addr = rx.await.expect("server did not bind");
+                assert!(addr.ip().is_loopback());
+
+                let rejected = deploy(addr.port(), "counter", "blob", &script).await;
+                assert!(rejected.is_err(), "class blob should fail");
+
+                deploy(addr.port(), "counter", "actor", &script)
+                    .await
+                    .expect("deploy");
+                let first = post_json(addr, "/counter/kitchen").await;
+                assert_eq!(first["heap"], 1, "{first}");
+                assert_eq!(first["sql"], 1, "{first}");
+
+                tokio::time::sleep(Duration::from_millis(3000)).await;
+                let second = post_json(addr, "/counter/kitchen").await;
+                assert_eq!(second["heap"], 1, "cold wake lost the heap reset: {second}");
+                assert_eq!(second["sql"], 2, "{second}");
+
+                let swapped = root.join("swapped.js");
+                std::fs::write(
+                    &swapped,
+                    "export default { async fetch(){ return { swapped: true }; } };\n",
+                )
+                .unwrap();
+                deploy(addr.port(), "counter", "actor", &swapped)
+                    .await
+                    .expect("redeploy");
+                let third = post_json(addr, "/counter/kitchen").await;
+                assert_eq!(third["swapped"], true, "{third}");
+
+                let text = meter_report(&root).unwrap();
+                assert!(text.starts_with("requests 3\n"), "{text}");
+                assert!(text.contains("\ncpu 3\n"), "{text}");
+                assert!(text.contains("\ncpu_ns "), "{text}");
+                assert!(!text.contains("egress"));
+                assert!(!text.contains("price"));
+                let conn = rusqlite::Connection::open(root.join("system.sqlite")).unwrap();
+                let mut stmt = conn
+                    .prepare("SELECT DISTINCT kind FROM meter ORDER BY kind")
+                    .unwrap();
+                let kinds: Vec<String> = stmt
+                    .query_map([], |row| row.get(0))
+                    .unwrap()
+                    .map(|row| row.unwrap())
+                    .collect();
+                assert_eq!(kinds, vec!["cpu".to_string(), "request".to_string()]);
+            })
+            .await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn guest_wasm() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/wasm32-wasip1/release/hypnos_guest.wasm")
+    }
+
+    async fn post_json(addr: SocketAddr, path: &str) -> serde_json::Value {
+        let client = reqwest::Client::builder().build().unwrap();
+        let url = format!("http://127.0.0.1:{}{path}", addr.port());
+        let resp = client
+            .post(&url)
+            .header("content-type", "application/json")
+            .body("{}")
+            .send()
+            .await
+            .unwrap_or_else(|e| panic!("post {url}: {e}"));
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        assert!(status.is_success(), "{status} {text}");
+        serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text}"))
     }
 
     fn temp_root(label: &str) -> PathBuf {
