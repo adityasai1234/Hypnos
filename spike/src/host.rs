@@ -264,11 +264,13 @@ pub fn open_engine(wasm_or_cwasm: &Path, from_wasm: bool, cfg: GuestCfg) -> Resu
     arm_epoch(&engine);
     let cwasm_bytes;
     let module = if from_wasm {
-        let wasm = std::fs::read(wasm_or_cwasm)?;
+        let wasm = std::fs::read(wasm_or_cwasm)
+            .with_context(|| wasm_or_cwasm.display().to_string())?;
         cwasm_bytes = engine.precompile_module(&wasm)?;
         unsafe { Module::deserialize(&engine, &cwasm_bytes)? }
     } else {
-        unsafe { Module::deserialize_file(&engine, wasm_or_cwasm)? }
+        unsafe { Module::deserialize_file(&engine, wasm_or_cwasm) }
+            .map_err(|e| anyhow!("{e}: {}", wasm_or_cwasm.display()))?
     };
     let pre = link(&engine, &module)?;
     Ok(Eng { engine, pre, cfg })

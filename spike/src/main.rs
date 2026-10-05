@@ -119,7 +119,7 @@ fn must_wasm(args: &[String]) -> Result<PathBuf> {
 
 fn load_script(args: &[String]) -> Result<String> {
     let path = opt(args, "--script").context("--script is required")?;
-    Ok(std::fs::read_to_string(path)?)
+    std::fs::read_to_string(&path).with_context(|| format!("script {path}"))
 }
 
 fn eng_from(args: &[String], meter: bool, ticks: u64, ai: Vec<AiEntry>) -> Result<Eng> {
@@ -221,7 +221,8 @@ async fn cmd_run(args: &[String]) -> Result<()> {
     let root = root_of(args);
     let meter = Meter::open(&root)?;
     println!("pid {}", std::process::id());
-    let mut script = std::fs::read_to_string(&script_path)?;
+    let mut script = std::fs::read_to_string(&script_path)
+        .with_context(|| format!("script {script_path}"))?;
     let mut eng = eng_from(args, true, host::EPOCH_TICKS, Vec::new())?;
     let mut actor = Actor::new(&root, "run", "main", &script)?;
     let out = actor.request(&eng, &meter, "{}").await?;
@@ -230,7 +231,8 @@ async fn cmd_run(args: &[String]) -> Result<()> {
     let mut line = String::new();
     let mut locked = stdin.lock();
     while locked.read_line(&mut line)? > 0 {
-        script = std::fs::read_to_string(&script_path)?;
+        script = std::fs::read_to_string(&script_path)
+            .with_context(|| format!("script {script_path}"))?;
         eng = eng_from(args, true, host::EPOCH_TICKS, Vec::new())?;
         actor.script = script.clone();
         actor.sleep();
