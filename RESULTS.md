@@ -72,4 +72,27 @@ Boot scan. This is a design signal, not a tuning knob.
 
 ## Verdict
 
-GO, provisional, for this container only. The wake is in the millisecond class, and the engine is the small part of it. The boot scan is the thing that will not scale as "one SQLite file per actor" without an alarm index. Repeat the wake table on the target PC before any product code.
+GO, provisional, for this container only. The wake is in the millisecond class, and the engine is the small part of it. The boot scan is the thing that will not scale as "one SQLite file per actor" without an alarm index. The Arch PC section below is the measurement that counts.
+
+## Arch PC
+
+The first `sudo wake-bench` on `/tmp/wake`. Intel Core Ultra 7 355, x86_64, Linux 7.2.4-arch1-2, glibc 2.44, rustc 1.99.0, flags sse4.1, sse4.2, avx, avx2. Totals only: this table has no open, instantiate, eval, or handler split and no iteration count. Times are p50 / p95 / p99 in microseconds.
+
+| Class | Total µs |
+|---|---|
+| Hot read | 57 / 115 / 127 |
+| Warm read | 544 / 590 / 760 |
+| Cold read | 946 / 1001 / 1007 |
+| Hot write | 41 / 46 / 55 |
+| Warm write | 585 / 609 / 647 |
+| Cold write | 985 / 1028 / 1049 |
+
+`fixed-line warm-write p50_us 585 engine_us 397 OUTSIDE` and `PASS wake-bench`. `OUTSIDE` means QuickJS at 397 µs is more than half of the 585 µs warm write, because this disk is faster than the container where the fsync dominated. The NO-GO line is an engine time above 20 ms. This engine time is 397 µs.
+
+On that same run the agent checks passed. Reject passed. Idle p99 was 128 µs, live p99 was 94 µs, and CPU was 1.15 ms during a 5 s model wait. The commit point passed.
+
+A later bench on the same `/tmp/wake` printed `FAIL warm heap check got {"heap":1,"sql":6}, want heap 1 sql 1`. The guest reset (`heap: 1`). The SQL file still held five rows from the first run, so the next insert was 6. That failure does not replace the first bench. Leave `/tmp/wake` alone.
+
+## Verdict on the Arch PC
+
+The engine kill gate passes. 397 µs is under 20 ms. The warm write is still sub-millisecond. One SQLite file per actor stays the wake path. An alarm index is still later work, for the boot scan, and it does not belong on this path.

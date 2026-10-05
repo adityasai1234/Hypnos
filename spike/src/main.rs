@@ -1,4 +1,4 @@
-mod host;
+use spike::host;
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};

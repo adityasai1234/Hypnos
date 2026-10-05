@@ -222,6 +222,13 @@ pub struct Ledger {
     pub cpus: i64,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct MeterTotals {
+    pub requests: i64,
+    pub cpu_rows: i64,
+    pub cpu_ns: i64,
+}
+
 pub fn engine_config(pooling: bool, epoch: bool, target: Option<&str>) -> Result<Config> {
     let mut config = Config::new();
     config.epoch_interruption(epoch);
@@ -637,7 +644,7 @@ pub fn actor_path(root: &Path, ns: &str, id: &str) -> PathBuf {
         .join(format!("{id}.sqlite"))
 }
 
-fn check_name(what: &str, s: &str) -> Result<()> {
+pub(crate) fn check_name(what: &str, s: &str) -> Result<()> {
     if s.is_empty() || s.contains(['/', '\\', '.']) {
         bail!("bad {what}");
     }
@@ -692,6 +699,24 @@ impl Meter {
             (ts, actor, kind, amount),
         )?;
         Ok(())
+    }
+
+    pub fn totals(&self) -> Result<MeterTotals> {
+        let conn = self.conn.lock().map_err(|e| anyhow!("{e}"))?;
+        let (requests, cpu_rows, cpu_ns): (i64, i64, i64) = conn.query_row(
+            "SELECT
+                coalesce(sum(CASE WHEN kind = 'request' THEN 1 ELSE 0 END), 0),
+                coalesce(sum(CASE WHEN kind = 'cpu' THEN 1 ELSE 0 END), 0),
+                coalesce(sum(CASE WHEN kind = 'cpu' THEN amount ELSE 0 END), 0)
+             FROM meter",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        Ok(MeterTotals {
+            requests,
+            cpu_rows,
+            cpu_ns,
+        })
     }
 
     pub fn ledger(&self) -> Result<Ledger> {
