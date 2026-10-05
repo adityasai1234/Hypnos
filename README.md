@@ -6,6 +6,89 @@ Model calls go through an allow-listed `env.AI` binding. Local and remote models
 
 The code in this repo is the measurement spike, not the daemon. There is no `hypnos serve` and no `hypnos deploy`. Spike numbers are provisional until the same wake bench has been run on the real Linux box.
 
+## On this Mac
+
+This machine is the operator. The repo is already here. Run the spike from the project directory. `spike run` prints one result and then waits for another line. Press Ctrl-C after the JSON line.
+
+```bash
+cd /Users/medow/Documents/Hypnos
+
+./target/release/spike sysinfo
+
+./target/release/spike compile \
+  target/wasm32-wasip1/release/hypnos_guest.wasm \
+  -o engine/guest.cwasm
+
+./target/release/spike run \
+  --wasm target/wasm32-wasip1/release/hypnos_guest.wasm \
+  --script scripts/counter.js \
+  --root /tmp/run
+
+./target/release/spike trap \
+  --wasm target/wasm32-wasip1/release/hypnos_guest.wasm \
+  --script scripts/counter.js \
+  --root /tmp/trap
+
+./target/release/spike agent \
+  --wasm target/wasm32-wasip1/release/hypnos_guest.wasm \
+  --script scripts/agent.js \
+  --root /tmp/agent \
+  --delay-ms 5000
+
+./target/release/spike wake-bench \
+  --wasm target/wasm32-wasip1/release/hypnos_guest.wasm \
+  --script scripts/counter.js \
+  --root /tmp/wake \
+  --iters 20 \
+  --cold-iters 3
+```
+
+Cold-cache lines print `SKIP` on macOS. That check needs Linux.
+
+`192.168.1.4` is this Mac. Do not `scp` to that address. On the Arch machine, run `hostname -I` and use the address it prints.
+
+```bash
+scp scripts/agent.js medow@ARCH:/tmp/agent.js
+scp scripts/counter.js medow@ARCH:/tmp/counter.js
+```
+
+Replace `ARCH` with that address. Remote login has to be enabled on the Arch machine (`sudo systemctl enable --now sshd`).
+
+## On the Arch Linux machine
+
+This machine is the host. These commands build the spike and run it there. There is no `hypnos` command.
+
+```bash
+sudo pacman -S --needed base-devel curl pkgconf git
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+rustup target add wasm32-wasip1
+
+git clone https://github.com/adityasai1234/Hypnos.git
+cd Hypnos
+
+cargo build -p hypnos-guest --target wasm32-wasip1 --release
+cargo build -p spike --release
+
+./target/release/spike sysinfo
+
+./target/release/spike run \
+  --wasm target/wasm32-wasip1/release/hypnos_guest.wasm \
+  --script /tmp/counter.js \
+  --root /tmp/run
+
+./target/release/spike agent \
+  --wasm target/wasm32-wasip1/release/hypnos_guest.wasm \
+  --script /tmp/agent.js \
+  --root /tmp/agent \
+  --delay-ms 5000
+```
+
+If `/tmp/counter.js` is not there yet, use `scripts/counter.js` and `scripts/agent.js` from the clone instead.
+
+`suite.sh` is for the Debian container used to measure the spike. It `cd`s to `/src` and writes build output to `/opt/target`. Do not run it on the Arch machine. Use the `./target/release/spike` commands above. Cold-cache numbers from this Mac do not count. Repeat `wake-bench` on the Arch machine when you want the number that matters.
+
 ## Deploy from one laptop to another
 
 One laptop is the operator. The other is the host. The host is the Linux machine. The operator never talks to Hypnos over the network.
